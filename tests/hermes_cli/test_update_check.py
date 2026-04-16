@@ -16,8 +16,8 @@ def test_version_string_no_v_prefix():
     assert not __version__.startswith("v"), f"__version__ should not start with 'v', got {__version__!r}"
 
 
-def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
-    """When cache is fresh, check_for_updates should return cached value without calling git."""
+def test_check_for_updates_uses_cache_when_head_matches(tmp_path, monkeypatch):
+    """Fresh cache is trusted when it matches the active repo path and HEAD."""
     from hermes_cli.banner import check_for_updates
 
     # Create a fake git repo and fresh cache
@@ -26,37 +26,74 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     (repo_dir / ".git").mkdir()
 
     cache_file = tmp_path / ".update_check"
-    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3}))
+    cache_file.write_text(json.dumps({
+        "ts": time.time(),
+        "behind": 3,
+        "repo": str(repo_dir.resolve()),
+        "head": "abc12345",
+    }))
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("hermes_cli.banner.subprocess.run") as mock_run:
+    with patch("hermes_cli.banner._resolve_repo_dir", return_value=repo_dir), \
+         patch("hermes_cli.banner._git_short_hash", return_value="abc12345"), \
+         patch("hermes_cli.banner.subprocess.run") as mock_run:
         result = check_for_updates()
 
     assert result == 3
     mock_run.assert_not_called()
 
 
-def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
-    """When cache is expired, check_for_updates should call git fetch."""
+def test_check_for_updates_ignores_fresh_cache_when_head_changes(tmp_path, monkeypatch):
+    """Fresh cache should be ignored after an update changes HEAD."""
     from hermes_cli.banner import check_for_updates
 
     repo_dir = tmp_path / "hermes-agent"
     repo_dir.mkdir()
     (repo_dir / ".git").mkdir()
 
-    # Write an expired cache (timestamp far in the past)
     cache_file = tmp_path / ".update_check"
-    cache_file.write_text(json.dumps({"ts": 0, "behind": 1}))
+    cache_file.write_text(json.dumps({
+        "ts": time.time(),
+        "behind": 1,
+        "repo": str(repo_dir.resolve()),
+        "head": "oldhead00",
+    }))
 
-    mock_result = MagicMock(returncode=0, stdout="5\n")
+    mock_result = MagicMock(returncode=0, stdout="0\n")
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("hermes_cli.banner.subprocess.run", return_value=mock_result) as mock_run:
+    with patch("hermes_cli.banner._resolve_repo_dir", return_value=repo_dir), \
+         patch("hermes_cli.banner._git_short_hash", return_value="newhead11"), \
+         patch("hermes_cli.banner.subprocess.run", return_value=mock_result) as mock_run:
         result = check_for_updates()
 
-    assert result == 5
+    assert result == 0
     assert mock_run.call_count == 2  # git fetch + git rev-list
 
+
+
+def test_check_for_updates_prefers_running_checkout_over_hermes_home_repo(tmp_path, monkeypatch):
+    """Use the repo backing the running package, not a stale HERMES_HOME clone."""
+    import hermes_cli.banner as banner
+
+    project_root = tmp_path / "project-checkout"
+    (project_root / ".git").mkdir(parents=True)
+    fake_banner = project_root / "hermes_cli" / "banner.py"
+    fake_banner.parent.mkdir(parents=True)
+    fake_banner.touch()
+
+    home_repo = tmp_path / "profile-home" / "hermes-agent"
+    (home_repo / ".git").mkdir(parents=True)
+
+    mock_result = MagicMock(returncode=0, stdout="0\n")
+
+    monkeypatch.setattr(banner, "__file__", str(fake_banner))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-home"))
+    with patch("hermes_cli.banner._git_short_hash", return_value="abc12345"),          patch("hermes_cli.banner.subprocess.run", return_value=mock_result) as mock_run:
+        banner.check_for_updates()
+
+    assert mock_run.call_args_list[0].kwargs["cwd"] == str(project_root.resolve())
+    assert mock_run.call_args_list[1].kwargs["cwd"] == str(project_root.resolve())
 
 def test_check_for_updates_no_git_dir(tmp_path, monkeypatch):
     """Returns None when .git directory doesn't exist anywhere."""
